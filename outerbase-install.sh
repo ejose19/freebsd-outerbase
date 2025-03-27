@@ -10,7 +10,7 @@
 # sh outerbase-install.sh <drive>
 #   shows output of `gpart show <drive>`, awaits confirmation before proceeding
 
-set -e
+set -xe
 
 ###
 ### install options
@@ -30,12 +30,13 @@ customdrives=
 #   2) a zpool named as in $poolname already imported with -o altroot=/mnt
 #   3) a device name for the outer base to be mounted at /mnt/outer
 outerbasedevice=
+# only need to be setup if using `partition` boottype
+bootdevice=
 #   4) fstabs for outer and inner base at the locations specified here:
 customfstabouter=
 customfstabinner=
 #   5) boot/loader.conf at the locations specified here:
 bootloaderconf=
-
 
 ###
 ### system properties
@@ -46,7 +47,8 @@ poolname=zroot
 
 # if set, the same root password will be set for the outer and inner base
 # if empty, you will be prompted separately for outer and inner base
-rootpw=
+outerrootpw=
+innerrootpw=
 
 # a geli passphrase containing spaces can be entered in quotes: "test 123"
 # if empty, you will be prompted for geli the passphrase (a total of 3 times)
@@ -71,9 +73,27 @@ if [ -n "$outerbasetxz" ] && [ ! -f "$outerbasetxz" ]; then
   exit
 fi
 
+# path to custom package for inner base
+# leave empty to use stock base system (/usr/freebsd-dist/base.txz)
+innerbasetxz=
+
+if [ -n "$innerbasetxz" ] && [ ! -f "$innerbasetxz" ]; then
+  echo "$innerbasetxz does not exist."
+  exit
+fi
+
+# path to custom package for kernel
+# leave empty to use stock kernel (/usr/freebsd-dist/kernel.txz)
+kerneltxz=
+
+if [ -n "$kerneltxz" ] && [ ! -f "$kerneltxz" ]; then
+  echo "$kerneltxz does not exist."
+  exit
+fi
+
 # if set, put "PermitRootLogin yes" in /etc/sshd.conf for outer and inner base
 # leave empty for default (SSH root login forbidden)
-rootSSH=set
+rootSSH="set"
 
 # if set, ensure that inner and outer base have distinct SSH host keys
 # this is more secure, but creates somewhat of a hassle on the client side
@@ -83,6 +103,11 @@ separateSSHhostkeys=
 # minimize user data. NOTE: if set, pkg cannot be used in the outer base.
 # leave empty for default (permanent /var file system)
 varmfs=
+
+# type of /boot (symlink, nullfs, partition)
+# if partition bootpartitionsize will be used
+boottype="partition"
+bootpartitionsize="1G"
 
 ###
 ### device selection
@@ -97,16 +122,19 @@ if [ -z "$customdrives" ]; then
 
     dialog --no-collapse --title "FYI: \`geom disk list\`" \
       --yes-label "Show \`gpart show -p\`" --no-label Exit \
-      --yesno "$(geom disk list)" 0 0 && \
-    dialog --no-collapse --title "FYI: \`gpart show -p $drive\`" \
-      --ok-label Exit --msgbox "$(gpart show -p)" 0 0
+      --yesno "$(geom disk list)" 0 0 &&
+      dialog --no-collapse --title "FYI: \`gpart show -p $drive\`" \
+        --ok-label Exit --msgbox "$(gpart show -p)" 0 0
 
     exit
   fi
 
   # called with argument: ask to confirm, then partition drive $1
   drive=$1
-  targetpart=$(geom disk list $drive; gpart show -p $drive 2>&1 || true )
+  targetpart=$(
+    geom disk list $drive
+    gpart show -p $drive 2>&1 || true
+  )
 
   dialog --title "FYI: \`geom disk list $drive; gpart show -p $drive\`" \
     --no-collapse --yes-label "DESTROY and use $drive" --no-label Abort \
@@ -116,11 +144,11 @@ else
 
   # customdrives: verify conditions as explained above
   echo "Verifying devices and paths. If the script fails here, check them."
-  zpool list -H $poolname        # fails if pool is not imported
-  [ -e "$outerbasedevice" ]      # fails if outer base device does not exist
-  [ -f "$customfstabouter" ]     # fails if no prepared fstab found
-  [ -f "$customfstabinner" ]     # fails if no prepared fstab found
-  [ -f "$bootloaderconf" ]       # fails if no prepared loader.conf found
+  zpool list -H $poolname    # fails if pool is not imported
+  [ -e "$outerbasedevice" ]  # fails if outer base device does not exist
+  [ -f "$customfstabouter" ] # fails if no prepared fstab found
+  [ -f "$customfstabinner" ] # fails if no prepared fstab found
+  [ -f "$bootloaderconf" ]   # fails if no prepared loader.conf found
 
   # if tests passed: verify to continue
   dialog --title "FYI: zpool list -v $poolname" \
@@ -129,28 +157,29 @@ else
 
 fi
 
-
 ###
 ### partitioning
 ###
 
 if [ -z "$customdrives" ]; then
 
-  gpart create -s gpt $drive || \
+  gpart create -s gpt $drive ||
     { gpart destroy -F $drive && gpart create -s gpt $drive; }
 
   if [ -n "$gptboot" ]; then
-    gpart add -a 1M -s 512k     -l gptboot -t freebsd-boot $drive
+    gpart add -a 1M -s 512k -l gptboot -t freebsd-boot $drive
   else
-    gpart add -a 1M -s 10M        -l efi   -t efi          $drive
+    gpart add -a 1M -s 10M -l efi -t efi $drive
   fi
-  gpart add   -a 1M -s $outersize -l outer -t freebsd-ufs  $drive
-  [ -n "$swapsize" ] && [ "$swapsize" != "0" ] && \
-    gpart add -a 1M -s $swapsize  -l swap  -t freebsd-swap $drive
-  gpart add   -a 1M               -l inner -t freebsd-zfs  $drive
+  if [ "$boottype" = "partition" ]; then
+    gpart add -a 1M -s $bootpartitionsize -l boot -t freebsd-ufs "$drive"
+  fi
+  gpart add -a 1M -s $outersize -l outer -t freebsd-ufs $drive
+  [ -n "$swapsize" ] && [ "$swapsize" != "0" ] &&
+    gpart add -a 1M -s $swapsize -l swap -t freebsd-swap $drive
+  gpart add -a 1M -l inner -t freebsd-zfs $drive
 
 fi
-
 
 ###
 ### boot code
@@ -172,7 +201,6 @@ if [ -z "$customdrives" ]; then
 
 fi
 
-
 ###
 ### encryption
 ###
@@ -180,7 +208,7 @@ fi
 if [ -z "$customdrives" ]; then
 
   if [ -n "$gelipassphrase" ]; then
-    echo $gelipassphrase | geli init   -J - /dev/gpt/inner
+    echo $gelipassphrase | geli init -J - /dev/gpt/inner
     echo $gelipassphrase | geli attach -j - /dev/gpt/inner
   else
     echo "Enter geli passphrase to initialize inner.eli:"
@@ -192,7 +220,6 @@ if [ -z "$customdrives" ]; then
   # encrypted swap defined in /etc/fstab needs no initialization
 
 fi
-
 
 ###
 ### inner zfs
@@ -206,18 +233,17 @@ fi
 # https://cgit.freebsd.org/
 #              src/tree/usr.sbin/bsdinstall/scripts/zfsboot?h=releng/14.1#n145
 zfs create -o mountpoint=none $poolname/ROOT
-zfs create -o mountpoint=/    $poolname/ROOT/default
-zfs create -o mountpoint=/home                $poolname/home
+zfs create -o mountpoint=/ $poolname/ROOT/default
+zfs create -o mountpoint=/home $poolname/home
 zfs create -o mountpoint=/usr -o canmount=off $poolname/usr
-zfs create -o setuid=off                      $poolname/usr/ports
-zfs create                                    $poolname/usr/src
+zfs create -o setuid=off $poolname/usr/ports
+zfs create $poolname/usr/src
 zfs create -o mountpoint=/var -o canmount=off $poolname/var
-zfs create -o exec=off -o setuid=off          $poolname/var/audit
-zfs create -o exec=off -o setuid=off          $poolname/var/crash
-zfs create -o exec=off -o setuid=off          $poolname/var/log
-zfs create -o atime=on                        $poolname/var/mail
-zfs create -o setuid=off                      $poolname/var/tmp
-
+zfs create -o exec=off -o setuid=off $poolname/var/audit
+zfs create -o exec=off -o setuid=off $poolname/var/crash
+zfs create -o exec=off -o setuid=off $poolname/var/log
+zfs create -o atime=on $poolname/var/mail
+zfs create -o setuid=off $poolname/var/tmp
 
 ###
 ### confirm disk setup
@@ -226,15 +252,22 @@ zfs create -o setuid=off                      $poolname/var/tmp
 if [ -z "$customdrives" ]; then
 
   if ! dialog --no-collapse --yes-label Install --no-label Abort \
-    --yesno "$(gpart show -pl $drive; ls -lt /dev/gpt; echo; zfs list)" 0 0; then
-    echo; echo "To start over, run the following commands:"; echo
+    --yesno "$(
+      gpart show -pl $drive
+      ls -lt /dev/gpt
+      echo
+      zfs list
+    )" 0 0; then
+    echo
+    echo "To start over, run the following commands:"
+    echo
     echo " # zpool export $poolname"
-    echo " # geli detach gpt/inner.eli"; echo
+    echo " # geli detach gpt/inner.eli"
+    echo
     exit
   fi
 
 fi
-
 
 ###
 ### outer filesystem
@@ -249,6 +282,15 @@ fi
 newfs -m2 $outerbasedevice
 mount $outerbasedevice /mnt/outer
 
+if [ "$boottype" = "partition" ]; then
+  if [ -z "$bootdevice" ]; then
+    bootdevice=/dev/gpt/boot
+  fi
+
+  newfs -m2 $bootdevice
+  mkdir /mnt/outer/boot
+  mount $bootdevice /mnt/outer/boot
+fi
 
 ###
 ### outer base install
@@ -265,37 +307,58 @@ if [ -n "$varmfs" ]; then
 fi
 tar -xvpPf $outerbasetxz $tarexcl -C /mnt/outer
 
-
 ###
 ### inner base install
 ###
 
-tar -xvpPf /usr/freebsd-dist/base.txz --exclude='boot/' -C /mnt
-ln -s /outer/boot /mnt/boot
-chflags -h sunlink /mnt/boot
+# use custom innerbase.txz if set
+if [ -z "$innerbasetxz" ]; then
+  innerbasetxz=/usr/freebsd-dist/base.txz
+fi
 
+tar -xvpPf $innerbasetxz --exclude='boot/' -C /mnt
+
+# /boot type
+if [ "$boottype" = "symlink" ]; then
+  ln -s /outer/boot /mnt/boot
+  chflags -h sunlink /mnt/boot
+elif [ "$boottype" = "nullfs" ]; then
+  mkdir /mnt/boot
+  mount -t nullfs /mnt/outer/boot /mnt/boot
+elif [ "$boottype" = "partition" ]; then
+  # Partition is already mounted
+  :
+fi
 
 ###
 ### shared /boot and kernel
 ###
 
-tar -xvpPf /usr/freebsd-dist/kernel.txz -C /mnt/outer
+# use custom kernel.txz if set
+if [ -z "$kerneltxz" ]; then
+  kerneltxz=/usr/freebsd-dist/kernel.txz
+fi
+
+tar -xvpPf $kerneltxz -C /mnt/outer
 
 if [ -z "$customdrives" ]; then
 
-  cat <<EOD >> /mnt/outer/boot/loader.conf
+  cat <<EOD >>/mnt/outer/boot/loader.conf
 autoboot_delay="4"
 vfs.root.mountfrom="ufs:/dev/gpt/outer"
 geom_eli_load="YES"
 zfs_load="YES"
 EOD
 
+  if [ "$boottype" = "nullfs" ]; then
+    echo "nullfs_load=\"YES\"" >>/mnt/outer/boot/loader.conf
+  fi
+
 else
 
-  cat $bootloaderconf >> /mnt/outer/boot/loader.conf
+  cat $bootloaderconf >>/mnt/outer/boot/loader.conf
 
 fi
-
 
 ###
 ### common config: system
@@ -310,16 +373,21 @@ chroot /mnt/outer service hostid onestart
 chroot /mnt/outer service hostid_save onestart
 cp /mnt/outer/etc/hostid /mnt/etc/
 
-if [ -n "$rootpw" ]; then
-  echo $rootpw | chroot /mnt/outer pw mod user root -h 0
-  echo $rootpw | chroot /mnt pw mod user root -h 0
+if [ -n "$outerrootpw" ]; then
+  echo "$outerrootpw" | chroot /mnt/outer pw mod user root -h 0
 else
-  echo; echo "Setting root password for outer base:"
+  echo
+  echo "Setting root password for outer base:"
   chroot /mnt/outer passwd
-  echo; echo "Setting root password for inner base:"
-  chroot /mnt passwd
 fi
 
+if [ -n "$innerrootpw" ]; then
+  echo "$innerrootpw" | chroot /mnt pw mod user root -h 0
+else
+  echo
+  echo "Setting root password for inner base:"
+  chroot /mnt passwd
+fi
 
 ###
 ### common config: ssh
@@ -328,8 +396,8 @@ fi
 chroot /mnt/outer sysrc sshd_enable=YES
 chroot /mnt sysrc sshd_enable=YES
 
-[ -n "$rootSSH" ] && \
- sed -i '' -e 's/^#\(PermitRootLogin\).*/\1 yes/' /mnt/outer/etc/ssh/sshd_config
+[ -n "$rootSSH" ] &&
+  sed -i '' -e 's/^#\(PermitRootLogin\).*/\1 yes/' /mnt/outer/etc/ssh/sshd_config
 
 chroot /mnt/outer service sshd onekeygen
 
@@ -340,7 +408,6 @@ if [ -n "$separateSSHhostkeys" ]; then
   rm /mnt/etc/ssh/ssh_host_*_key*
   chroot /mnt service sshd onekeygen
 fi
-
 
 ###
 ### outer config
@@ -360,22 +427,27 @@ fi
 if [ -z "$customdrives" ]; then
 
   if [ -z "$gptboot" ]; then
-    cat <<EOD >> /mnt/outer/etc/fstab
+    cat <<EOD >>/mnt/outer/etc/fstab
 /dev/gpt/efi   /boot/efi msdosfs rw,noauto  1 1
 EOD
   fi
-  cat <<EOD >> /mnt/outer/etc/fstab
+  if [ "$boottype" = "partition" ]; then
+    cat <<EOD >>/mnt/outer/etc/fstab
+/dev/gpt/boot  /boot     ufs     rw 0 0
+EOD
+  fi
+  cat <<EOD >>/mnt/outer/etc/fstab
 /dev/gpt/outer /         ufs     rw,noatime 1 1
 EOD
 # the outer base doesn't get swap, as there should be no need for it
 
 else
 
-  cat $customfstabouter >> /mnt/outer/etc/fstab
+  cat $customfstabouter >>/mnt/outer/etc/fstab
 
 fi
 
-cat <<EOD > /mnt/outer/root/unlock.sh
+cat <<EOD >/mnt/outer/root/unlock.sh
 #!/bin/sh
 set -e
 
@@ -407,7 +479,6 @@ dialog --msgbox "Now editing _outer base_ configuration." 0 0
 mount -t devfs devfs /mnt/outer/dev
 chroot /mnt/outer/ bsdconfig || true
 
-
 ###
 ### inner config
 ###
@@ -418,28 +489,32 @@ chroot /mnt/ sysrc zfs_enable=YES
 if [ -z "$customdrives" ]; then
 
   if [ -z "$gptboot" ]; then
-    cat <<EOD >> /mnt/etc/fstab
+    cat <<EOD >>/mnt/etc/fstab
 /dev/gpt/efi      /boot/efi msdosfs rw,noauto  1 1
 EOD
   fi
-  cat <<EOD >> /mnt/etc/fstab
+  if [ "$boottype" = "partition" ]; then
+    cat <<EOD >>/mnt/etc/fstab
+/dev/gpt/boot /boot         ufs     rw 0 0
+EOD
+  fi
+  cat <<EOD >>/mnt/etc/fstab
 /dev/gpt/outer    /outer    ufs     rw,noatime 1 1
 tmpfs             /tmp      tmpfs   rw,mode=777,nosuid 0 0
 EOD
 
-  [ -n "$swapsize" ] && [ "$swapsize" != "0" ] && cat <<EOD >> /mnt/etc/fstab
+  [ -n "$swapsize" ] && [ "$swapsize" != "0" ] && cat <<EOD >>/mnt/etc/fstab
 /dev/gpt/swap.eli none      swap    sw 0 0
 EOD
 else
 
-  cat $customfstabinner >> /mnt/etc/fstab
+  cat $customfstabinner >>/mnt/etc/fstab
 
 fi
 
 dialog --msgbox "Now editing _inner base_ configuration." 0 0
 mount -t devfs devfs /mnt/dev
 chroot /mnt/ bsdconfig || true
-
 
 ###
 ### cleanup
@@ -448,24 +523,33 @@ chroot /mnt/ bsdconfig || true
 killall dhclient || true
 
 if dialog --yes-label "Yes, export" --no-label "No, inspect" \
-   --yesno "All done. Unmount all filesystems and export $poolname?" 0 0; then
+  --yesno "All done. Unmount all filesystems and export $poolname?" 0 0; then
   umount -f /mnt/outer/dev
   umount -f /mnt/dev
+  if [ "$boottype" = "partition" ]; then
+    umount /mnt/outer/boot
+  fi
   umount /mnt/outer
   zpool export $poolname
   if [ -z "$customdrives" ]; then
     geli detach gpt/inner.eli
   else
-    echo; echo "!!! Don't forget to tweak /mnt/outer/root/unlock.sh !!!"; echo
+    echo
+    echo "!!! Don't forget to tweak /mnt/outer/root/unlock.sh !!!"
+    echo
   fi
   exit
 fi
 
-echo; echo
+echo
+echo
 echo "--- Before rebooting, do the following: ---"
 echo
 echo "# umount -f /mnt/outer/dev"
 echo "# umount -f /mnt/dev"
+if [ "$boottype" = "partition" ]; then
+  echo "# umount /mnt/outer/boot"
+fi
 echo "# umount /mnt/outer"
 echo "# zpool export $poolname"
 echo
@@ -474,8 +558,11 @@ echo "the pool. If that happens, your best option is to force import once:"
 echo
 echo "# zpool import -Nf $poolname"
 echo
-echo "... and just reboot."; echo
+echo "... and just reboot."
+echo
 
 if [ -n "$customdrives" ]; then
-  echo; echo "!!! Don't forget to tweak /mnt/outer/root/unlock.sh !!!"; echo
+  echo
+  echo "!!! Don't forget to tweak /mnt/outer/root/unlock.sh !!!"
+  echo
 fi
